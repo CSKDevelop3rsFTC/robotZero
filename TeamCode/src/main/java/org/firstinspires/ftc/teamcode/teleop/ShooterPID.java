@@ -1,131 +1,135 @@
 package org.firstinspires.ftc.teamcode.teleop;
 
-import com.bylazar.configurables.annotations.Configurable;
+import com.acmerobotics.dashboard.telemetry.MultipleTelemetry;
 import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.DcMotorSimple;
 import com.qualcomm.robotcore.hardware.HardwareMap;
+import com.qualcomm.robotcore.hardware.VoltageSensor;
+import com.seattlesolvers.solverslib.controller.PIDFController;
 
-@Configurable
+/**
+ * Shooter controller that uses EXACTLY the same PIDF logic as your newTuner opmode.
+ * TARGET_VEL is treated as "target RPM" (same units as getVelocity()).
+ */
 public class ShooterPID {
 
-    // 5203 1:1: 28 ticks per rev at output shaft
-    private static final double TICKS_PER_REV = 28.0;
+    // Same tunables as in newTuner
+    public static double P = 0.004;
+    public static double I = 0.0;
+    public static double D = 0.000;
+    public static double F = 0.00044;
 
-    // PIDF constants – SAME values you tuned
-    @Configurable
-    public static class constants {
-        public static double Kp = 0.1;
-        public static double Ki = 0.0;
-        public static double Kd = 0.0;
-        public static double Kf = 0.00023;
+    // "RPM" / velocity units, same as TARGET_VEL in newTuner
+    public static double TARGET_VEL = 0.0;
+    public static double POS_TOLERANCE = 0.0;
 
-        // you can add more presets later if you want
-        public static double DEFAULT_RPM = 3500.0;
+    private final DcMotorEx leftMotor;
+    private final DcMotorEx rightMotor;
+    private final PIDFController launcherPIDF;
+
+    // OPTIONAL: can be set from your OpMode if you want dashboard telemetry
+    private MultipleTelemetry dashTel = null;
+
+    private final VoltageSensor battery;
+
+    // last measured velocity (same units as getVelocity())
+    private double lastVel = 0.0;
+
+    public ShooterPID(HardwareMap hardwareMap, String leftName, String rightName) {
+        // Hardware: EXACT motor setup as newTuner
+        leftMotor  = hardwareMap.get(DcMotorEx.class, leftName);
+        rightMotor = hardwareMap.get(DcMotorEx.class, rightName);
+
+        // Make them spin the same direction
+        leftMotor.setDirection(DcMotorSimple.Direction.FORWARD);
+        rightMotor.setDirection(DcMotorSimple.Direction.REVERSE);
+
+        leftMotor.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        rightMotor.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+
+        leftMotor.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
+        rightMotor.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
+
+        launcherPIDF = new PIDFController(P, I, D, F);
+        launcherPIDF.setTolerance(POS_TOLERANCE, 0.0);
+
+        VoltageSensor vs = null;
+        if (hardwareMap.voltageSensor.iterator().hasNext()) {
+            vs = hardwareMap.voltageSensor.iterator().next();
+        }
+        battery = vs;
     }
 
-    private final DcMotorEx m1, m2;
-
-    // state
-    private int lastPos1 = 0;
-    private int lastPos2 = 0;
-    private boolean firstLoop = true;
-
-    private double integral = 0.0;
-    private double lastError = 0.0;
-    private double currentRPM = 0.0;
-    private double targetRPM = 0.0;
-
-    public ShooterPID(HardwareMap hw, String m1Name, String m2Name) {
-        m1 = hw.get(DcMotorEx.class, m1Name);
-        m2 = hw.get(DcMotorEx.class, m2Name);
-
-        m1.setDirection(DcMotorSimple.Direction.FORWARD);
-        m2.setDirection(DcMotorSimple.Direction.REVERSE);
-
-        m1.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
-        m2.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
-        m1.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
-        m2.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
-
-        m1.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
-        m2.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
-
-        firstLoop = true;
-        integral = 0.0;
-        lastError = 0.0;
+    // Call this once from your OpMode if you want dashboard telemetry
+    public void setTelemetry(MultipleTelemetry telemetry) {
+        this.dashTel = telemetry;
     }
 
-    // call this from TeleOp when you want a new speed
+    // ===== API for TeleOp =====
+
+    // treat this as "target RPM", 1:1 with TARGET_VEL
     public void setTargetRPM(double rpm) {
-        targetRPM = Math.max(0.0, rpm);
+        if (rpm < 0) rpm = 0;
+        TARGET_VEL = rpm;
     }
 
     public double getTargetRPM() {
-        return targetRPM;
+        return TARGET_VEL;
     }
 
     public double getCurrentRPM() {
-        return currentRPM;
+        return lastVel;
     }
 
-    // call this ONCE PER LOOP from your TeleOp, pass in dt in seconds
-    public void update(double dt) {
-        if (dt <= 0) dt = 1e-3;
+    /**
+     * Call once per loop. This is literally the body of your newTuner while-loop,
+     * minus the required telemetry.
+     */
+    public void update() {
+        // read velocities ("ticks/sec" or "rpm" – same units as newTuner)
+        double velLeft  = leftMotor.getVelocity();
+        double velRight = rightMotor.getVelocity();
+        double motorVel = 0.5 * (velLeft + velRight);
 
-        currentRPM = getAverageRPM(dt);
+        lastVel = motorVel;
 
-        double error = targetRPM - currentRPM;
+        // battery voltage for F scaling
+        double voltage = 12.0;
+        if (battery != null) {
+            voltage = battery.getVoltage();
+        }
 
-        integral += error * dt;
-        double derivative = (error - lastError) / dt;
-        lastError = error;
+        // update gains live from P/I/D/F
+        // scale F by voltage so behavior stays similar as battery sags
+        double scaledF = (voltage > 1.0) ? F / (voltage / 12.0) : F;
+        launcherPIDF.setPIDF(P, I, D, scaledF);
+        launcherPIDF.setTolerance(POS_TOLERANCE, 0.0);
+        launcherPIDF.setSetPoint(TARGET_VEL);
 
-        double pid = constants.Kp * error + constants.Ki * integral + constants.Kd * derivative;
-        double ff  = constants.Kf * targetRPM;
+        // controller output (same call)
+        double power = launcherPIDF.calculate(motorVel, TARGET_VEL);
 
-        double power = pid + ff;
-
+        // clamp (0..1 for flywheel)
         if (power > 1.0) power = 1.0;
         if (power < 0.0) power = 0.0;
 
-        m1.setPower(power);
-        m2.setPower(power);
-    }
+        leftMotor.setPower(power);
+        rightMotor.setPower(power);
 
-    private double getAverageRPM(double dt) {
-        int p1 = m1.getCurrentPosition();
-        int p2 = m2.getCurrentPosition();
-
-        double rpm1, rpm2;
-
-        if (firstLoop) {
-            rpm1 = 0.0;
-            rpm2 = 0.0;
-            firstLoop = false;
-        } else {
-            rpm1 = ticksToRpm(p1 - lastPos1, dt);
-            rpm2 = ticksToRpm(p2 - lastPos2, dt);
+        // only log if telemetry was actually set
+        if (dashTel != null) {
+            dashTel.addData("Target vel", TARGET_VEL);
+            dashTel.addData("Actual vel", motorVel);
+            dashTel.addData("Power", power);
+            dashTel.addData("Voltage", voltage);
+            dashTel.update();
         }
-
-        lastPos1 = p1;
-        lastPos2 = p2;
-
-        return 0.5 * (rpm1 + rpm2);
     }
 
-    private static double ticksToRpm(int deltaTicks, double dt) {
-        double revs = deltaTicks / TICKS_PER_REV;
-        double rps  = revs / Math.max(dt, 1e-6);
-        return rps * 60.0;
-    }
-
-    // convenience helper if you ever want to stop & coast
     public void stop() {
-        targetRPM = 0.0;
-        m1.setPower(0.0);
-        m2.setPower(0.0);
-        integral = 0.0;
-        lastError = 0.0;
+        TARGET_VEL = 0.0;
+        leftMotor.setPower(0.0);
+        rightMotor.setPower(0.0);
     }
 }
